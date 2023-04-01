@@ -6,7 +6,7 @@ use std::{
 use async_compression::tokio::bufread::*;
 use async_stream::try_stream;
 use futures::{Stream, StreamExt, TryStream, TryStreamExt};
-use protobuf::Message;
+use quick_protobuf::{BytesReader, MessageRead, MessageWrite, Writer};
 use thiserror::Error;
 use tokio::io::{
     AsyncBufRead, AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt,
@@ -20,7 +20,7 @@ pub mod protos {
 }
 
 use protos::{
-    fileformat::{blob::Data, Blob, BlobHeader},
+    fileformat::{mod_Blob::OneOfdata as Data, Blob, BlobHeader},
     osmformat::{HeaderBlock, PrimitiveBlock},
 };
 
@@ -41,8 +41,8 @@ const OSM_DATA_TYPE: &str = "OSMData";
 pub enum ParseError {
     #[error(transparent)]
     Io(#[from] tokio::io::Error),
-    #[error("Failed to parse protobuf message: {0}")]
-    Proto(#[from] protobuf::Error),
+    #[error("Failed to deserialize protobuf message: {0}")]
+    Proto(#[from] quick_protobuf::Error),
     #[error("BlobHeader is too long: {0} bytes")]
     BlobHeaderExceedsMaxLength(usize),
     #[error("Blob is too long: {0} bytes")]
@@ -53,23 +53,23 @@ pub enum ParseError {
 
 /// Parse blob headers + blobs on the fly
 fn stream_blobs<R: AsyncRead + Unpin>(
-    pbf_reader: &mut R,
-) -> impl TryStream<Ok = (BlobHeader, Blob), Error = ParseError> + Unpin + '_ {
+    mut pbf_reader: R,
+) -> impl TryStream<Ok = (BlobHeader, Blob), Error = ParseError> + Unpin {
     Box::pin(try_stream! {
         loop {
-            let blob_header_len = if let Some(len) = read_blob_header_len(pbf_reader).await? { len } else { break; };
-
+            let blob_header_len = if let Some(len) = read_blob_header_len(&mut pbf_reader).await? { len } else { break; };
             let mut buf = vec![0; blob_header_len];
             pbf_reader.read_exact(buf.as_mut()).await?;
-            let header = BlobHeader::parse_from_bytes(buf.as_slice())?;
-            let datasize = header.datasize() as usize;
+            let header: BlobHeader = deserialize_from_slice(buf.as_slice())?;
+
+            let datasize = header.datasize as usize;
             if datasize > BLOB_MAX_LEN {
                 Err(ParseError::BlobExceedsMaxLength(datasize))?;
             }
 
             let mut buf = vec![0; datasize];
             pbf_reader.read_exact(buf.as_mut()).await?;
-            let body = Blob::parse_from_bytes(buf.as_slice())?;
+            let body: Blob = deserialize_from_slice(buf.as_slice())?;
 
             yield (header, body);
         }
@@ -78,20 +78,20 @@ fn stream_blobs<R: AsyncRead + Unpin>(
 
 /// Same as [stream_blobs] but seeks past the blobs
 fn stream_blob_headers<R: AsyncRead + Unpin + AsyncSeek>(
-    pbf_reader: &mut R,
-) -> impl TryStream<Ok = (BlobHeader, SeekFrom), Error = ParseError> + Unpin + '_ {
+    mut pbf_reader: R,
+) -> impl TryStream<Ok = (BlobHeader, SeekFrom), Error = ParseError> + Unpin {
     Box::pin(try_stream! {
         let mut current_seek = 0;
         loop {
-            let blob_header_len = if let Some(len) = read_blob_header_len(pbf_reader).await? { len } else { break; };
+            let blob_header_len = if let Some(len) = read_blob_header_len(&mut pbf_reader).await? { len } else { break; };
             // i32 = 4 bytes
             current_seek += 4;
 
             let mut buf = vec![0; blob_header_len];
             pbf_reader.read_exact(buf.as_mut()).await?;
-            let header = BlobHeader::parse_from_bytes(buf.as_slice())?;
+            let header: BlobHeader = deserialize_from_slice(buf.as_slice())?;
             current_seek += blob_header_len;
-            let datasize = header.datasize() as usize;
+            let datasize = header.datasize as usize;
             if datasize > BLOB_MAX_LEN {
                 Err(ParseError::BlobExceedsMaxLength(datasize))?;
             }
@@ -107,7 +107,7 @@ fn stream_blob_headers<R: AsyncRead + Unpin + AsyncSeek>(
 
 /// Convenience function for getting the length of the next blob header, if any remain
 async fn read_blob_header_len<R: AsyncRead + Unpin>(
-    pbf_reader: &mut R,
+    mut pbf_reader: R,
 ) -> Result<Option<usize>, ParseError> {
     match pbf_reader.read_i32().await.map(|len| len as usize) {
         Ok(size) if size > BLOB_HEADER_MAX_LEN => Err(ParseError::BlobHeaderExceedsMaxLength(size)),
@@ -118,25 +118,25 @@ async fn read_blob_header_len<R: AsyncRead + Unpin>(
 }
 
 /// Creates a stream for the decoded data from this block
+///
+/// [quick_protobuf::reader::deserialize_from_slice] but doesn't read length
 fn decode_blob(blob: Blob) -> Result<Pin<Box<dyn AsyncRead>>, ParseError> {
-    Ok(match blob.data.unwrap_or_else(|| Data::Raw(vec![])) {
-        Data::Raw(raw) => Box::pin(Cursor::new(raw)),
+    Ok(match blob.data {
+        Data::raw(raw) => Box::pin(Cursor::new(raw)),
         #[cfg(feature = "zlib")]
-        Data::ZlibData(data) => Box::pin(ZlibDecoder::new(Cursor::new(data))),
+        Data::zlib_data(data) => Box::pin(ZlibDecoder::new(Cursor::new(data))),
         #[cfg(feature = "lzma")]
-        Data::LzmaData(data) => Box::pin(LzmaDecoder::new(Cursor::new(data))),
-        #[cfg(feature = "bzip2")]
-        Data::OBSOLETEBzip2Data(data) => Box::pin(BzDecoder::new(Cursor::new(data))),
+        Data::lzma_data(data) => Box::pin(LzmaDecoder::new(Cursor::new(data))),
         #[cfg(feature = "zstd")]
-        Data::ZstdData(data) => Box::pin(ZstdDecoder::new(Cursor::new(data))),
+        Data::zstd_data(data) => Box::pin(ZstdDecoder::new(Cursor::new(data))),
+        Data::None => Box::pin(Cursor::new(vec![])),
         other => {
             return Err(ParseError::UnsupportedCompression(match other {
-                Data::Raw(_) => unreachable!(),
-                Data::ZlibData(_) => "zlib",
-                Data::LzmaData(_) => "lzma",
-                Data::OBSOLETEBzip2Data(_) => "bzip2",
-                Data::Lz4Data(_) => "lz4",
-                Data::ZstdData(_) => "zstd",
+                Data::raw(_) | Data::None => unreachable!(),
+                Data::zlib_data(_) => "zlib",
+                Data::lzma_data(_) => "lzma",
+                Data::lz4_data(_) => "lz4",
+                Data::zstd_data(_) => "zstd",
             }))
         }
     })
@@ -148,7 +148,7 @@ fn stream_osm_blocks(
 ) -> impl TryStream<Ok = FileBlock, Error = ParseError> + Unpin {
     Box::pin(try_stream! {
         while let Some((blob_header, blob_body)) = blob_stream.try_next().await? {
-            let blob_body_len = blob_body.raw_size() as usize;
+            let blob_body_len = blob_body.raw_size.unwrap_or_default() as usize;
             if blob_body_len > BLOB_MAX_LEN {
                 Err(ParseError::BlobExceedsMaxLength(blob_body_len))?;
             }
@@ -156,12 +156,12 @@ fn stream_osm_blocks(
             let mut blob_stream = decode_blob(blob_body)?;
             blob_stream.read_to_end(&mut buf).await?;
 
-            match blob_header.type_() {
+            match blob_header.type_pb.as_str() {
                 "OSMHeader" => {
-                    yield FileBlock::Header(HeaderBlock::parse_from_bytes(buf.as_slice())?);
+                    yield FileBlock::Header(deserialize_from_slice(buf.as_slice())?);
                 },
                 "OSMData" => {
-                    yield FileBlock::Primitive(PrimitiveBlock::parse_from_bytes(buf.as_slice())?);
+                    yield FileBlock::Primitive(deserialize_from_slice(buf.as_slice())?);
                 }
                 other => {
                     yield FileBlock::Other { r#type: other.to_string(), bytes: buf, }
@@ -200,32 +200,32 @@ pub struct FileBlockLocation {
 }
 
 /// Parse the PBF format into a stream of [FileBlock]s
-pub fn parse_osm_pbf<R: AsyncRead + Unpin>(
-    pbf_reader: &mut R,
-) -> impl TryStream<Ok = FileBlock, Error = ParseError> + Unpin + '_ {
+pub fn parse_osm_pbf<'a, R: AsyncRead + Unpin + 'a>(
+    pbf_reader: R,
+) -> impl TryStream<Ok = FileBlock, Error = ParseError> + Unpin + 'a {
     stream_osm_blocks(stream_blobs(pbf_reader))
 }
 
 /// Cursory examination of the data to get a stream of [FileBlockLocation]s
 ///
-/// Use this in combination with [parse_osm_pbf_from_locations].
-pub fn get_osm_pbf_locations<R: AsyncRead + AsyncSeek + Unpin>(
-    pbf_reader: &mut R,
-) -> impl TryStream<Ok = FileBlockLocation, Error = ParseError> + Unpin + '_ {
+/// Use this in combination with [parse_osm_pbf_from_locations] for reading in parallel.
+pub fn get_osm_pbf_locations<'a, R: AsyncRead + AsyncSeek + Unpin + 'a>(
+    pbf_reader: R,
+) -> impl TryStream<Ok = FileBlockLocation, Error = ParseError> + Unpin + 'a {
     Box::pin(try_stream! {
         let mut headers = stream_blob_headers(pbf_reader);
 
         while let Some((header, seek)) = headers.try_next().await? {
-            yield FileBlockLocation { r#type: header.type_().to_string(), seek, len: header.datasize() as usize }
+            yield FileBlockLocation { r#type: header.type_pb, seek, len: header.datasize as usize }
         }
     })
 }
 
 /// Parse the PBF format into a stream of [FileBlock]s
 ///
-/// Use this in combination with [get_osm_pbf_locations].
-pub fn parse_osm_pbf_from_locations<'a, R: AsyncRead + AsyncSeek + Unpin>(
-    pbf_reader: &'a mut R,
+/// Use this in combination with [get_osm_pbf_locations] for reading in parallel.
+pub fn parse_osm_pbf_from_locations<'a, R: AsyncRead + AsyncSeek + Unpin + 'a>(
+    mut pbf_reader: R,
     mut locations: impl Stream<Item = FileBlockLocation> + Unpin + 'a,
 ) -> impl TryStream<Ok = FileBlock, Error = ParseError> + Unpin + 'a {
     Box::pin(try_stream! {
@@ -234,9 +234,9 @@ pub fn parse_osm_pbf_from_locations<'a, R: AsyncRead + AsyncSeek + Unpin>(
 
             let mut buf = vec![0; location.len];
             pbf_reader.read_exact(buf.as_mut()).await?;
-            let blob_body = Blob::parse_from_bytes(buf.as_slice())?;
+            let blob_body: Blob = deserialize_from_slice(buf.as_slice())?;
 
-            let blob_body_len = blob_body.raw_size() as usize;
+            let blob_body_len = blob_body.raw_size.unwrap_or_default() as usize;
             if location.len > BLOB_MAX_LEN {
                 Err(ParseError::BlobExceedsMaxLength(blob_body_len))?;
             }
@@ -247,10 +247,10 @@ pub fn parse_osm_pbf_from_locations<'a, R: AsyncRead + AsyncSeek + Unpin>(
 
             match location.r#type.as_str() {
                 "OSMHeader" => {
-                    yield FileBlock::Header(HeaderBlock::parse_from_bytes(buf.as_slice())?);
+                    yield FileBlock::Header(deserialize_from_slice(buf.as_slice())?);
                 },
                 "OSMData" => {
-                    yield FileBlock::Primitive(PrimitiveBlock::parse_from_bytes(buf.as_slice())?);
+                    yield FileBlock::Primitive(deserialize_from_slice(buf.as_slice())?);
                 }
                 _ => {
                     yield FileBlock::Other { r#type: location.r#type, bytes: buf, }
@@ -260,10 +260,16 @@ pub fn parse_osm_pbf_from_locations<'a, R: AsyncRead + AsyncSeek + Unpin>(
     })
 }
 
+fn deserialize_from_slice<'a, M: MessageRead<'a>>(
+    bytes: &'a [u8],
+) -> Result<M, quick_protobuf::Error> {
+    let mut reader = BytesReader::from_bytes(bytes);
+    reader.read_message_by_len(bytes, bytes.len())
+}
+
 /// Encoder to use when writing to a PBF file
 ///
 /// This will only include encoders from enabled features.
-/// Bzip2 is not an option since it is deprecated.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Encoder {
     #[cfg(feature = "zlib")]
@@ -283,15 +289,15 @@ pub enum WriteError {
     BlobHeaderExceedsMaxLength(usize),
     #[error("Blob is too long: {0} bytes")]
     BlobExceedsMaxLength(usize),
-    #[error("Blob is compressed with an unsupported algorithm: {0}")]
-    UnsupportedCompression(&'static str),
+    #[error("Failed to serialize protobuf message: {0}")]
+    Proto(#[from] quick_protobuf::Error),
 }
 
 /// Applies the requested compression scheme, if any
-fn encode<R: AsyncBufRead + Unpin>(
-    reader: &mut R,
+fn encode<R: AsyncBufRead + Unpin + 'static>(
+    reader: R,
     encoder: Option<Encoder>,
-) -> Pin<Box<dyn AsyncRead + '_>> {
+) -> Pin<Box<dyn AsyncRead>> {
     if let Some(encoder) = encoder {
         match encoder {
             #[cfg(feature = "zlib")]
@@ -309,27 +315,31 @@ fn encode<R: AsyncBufRead + Unpin>(
 /// Write a stream of [FileBlock]s in the PBF format
 pub async fn write_osm_pbf<W: AsyncWrite + Unpin>(
     mut blocks: impl Stream<Item = FileBlock> + Unpin,
-    out: &mut W,
+    mut out: W,
     encoder: Option<Encoder>,
-) -> tokio::io::Result<()> {
+) -> Result<(), WriteError> {
     while let Some(block) = blocks.next().await {
-        let (raw_size, blob_bytes, type_) = match block {
+        let (raw_size, blob_bytes, type_pb) = match block {
             FileBlock::Header(header) => (
-                header.compute_size(),
-                header.write_to_bytes()?,
+                header.get_size(),
+                serialize_into_vec(&header)?,
                 OSM_HEADER_TYPE.to_string(),
             ),
             FileBlock::Primitive(primitive) => (
-                primitive.compute_size(),
-                primitive.write_to_bytes()?,
+                primitive.get_size(),
+                serialize_into_vec(&primitive)?,
                 OSM_DATA_TYPE.to_string(),
             ),
-            FileBlock::Other { r#type, bytes } => (bytes.len() as u64, bytes, r#type),
+            FileBlock::Other { r#type, bytes } => (bytes.len(), bytes, r#type),
         };
 
+        if raw_size > BLOB_MAX_LEN {
+            Err(WriteError::BlobExceedsMaxLength(raw_size))?;
+        }
+
         let blob_encoded = {
-            let mut cursor = Cursor::new(blob_bytes);
-            let mut encoded = encode(&mut cursor, encoder);
+            let cursor = Cursor::new(blob_bytes);
+            let mut encoded = encode(cursor, encoder);
             let mut buf = vec![];
             encoded.read_to_end(&mut buf).await?;
             buf
@@ -341,47 +351,68 @@ pub async fn write_osm_pbf<W: AsyncWrite + Unpin>(
             } else {
                 None
             },
-            data: Some(match encoder {
+            data: match encoder {
                 #[cfg(feature = "zlib")]
-                Some(Encoder::Zlib) => Data::ZlibData(blob_encoded),
+                Some(Encoder::Zlib) => Data::zlib_data(blob_encoded),
                 #[cfg(feature = "zstd")]
-                Some(Encoder::Zstd) => Data::ZstdData(blob_encoded),
+                Some(Encoder::Zstd) => Data::zstd_data(blob_encoded),
                 #[cfg(feature = "lzma")]
-                Some(Encoder::Lzma) => Data::LzmaData(blob_encoded),
-                None => Data::Raw(blob_encoded),
-            }),
-            ..Default::default()
+                Some(Encoder::Lzma) => Data::lzma_data(blob_encoded),
+                None => Data::raw(blob_encoded),
+            },
         };
 
         let blob_header = BlobHeader {
-            type_: Some(type_),
+            type_pb,
             indexdata: None,
-            datasize: Some(blob.compute_size() as i32),
-            ..Default::default()
+            datasize: blob.get_size() as i32,
         };
 
-        out.write_i32(blob_header.compute_size() as i32).await?;
-        out.write_all(&blob_header.write_to_bytes()?).await?;
-        out.write_all(&blob.write_to_bytes()?).await?;
+        let blob_header_size = blob_header.get_size();
+        if blob_header_size > BLOB_HEADER_MAX_LEN {
+            Err(WriteError::BlobHeaderExceedsMaxLength(blob_header_size))?;
+        }
+
+        out.write_i32(blob_header_size as i32).await?;
+        out.write_all(&serialize_into_vec(&blob_header)?).await?;
+        out.write_all(&serialize_into_vec(&blob)?).await?;
     }
     Ok(())
+}
+
+/// [quick_protobuf::writer::serialize_into_vec] but doesn't write length
+fn serialize_into_vec<M: MessageWrite>(message: &M) -> Result<Vec<u8>, quick_protobuf::Error> {
+    let len = message.get_size();
+    let mut v = Vec::with_capacity(len);
+
+    {
+        let mut writer = Writer::new(&mut v);
+        message.write_message(&mut writer)?;
+    }
+    Ok(v)
 }
 
 #[cfg(test)]
 mod tests {
     use futures::{stream, TryStreamExt};
-    use tokio::io::AsyncSeekExt;
     use std::io::{Cursor, SeekFrom};
+    use tokio::io::AsyncSeekExt;
 
     use crate::{
         get_osm_pbf_locations, parse_osm_pbf, parse_osm_pbf_from_locations, write_osm_pbf, Encoder,
     };
 
-    const HONOLULU_OSM_PBF: &[u8] = include_bytes!("../honolulu_hawaii.osm.pbf");
+    /// <https://www.openstreetmap.org/api/0.6/map?bbox=-122.3199%2C47.4303%2C-122.2964%2C47.4647>
+    ///
+    /// ```bash
+    /// wget 'https://www.openstreetmap.org/api/0.6/map?bbox=-122.3199%2C47.4303%2C-122.2964%2C47.4647' -O seatac.osm
+    /// osmosis --read-xml seatac.osm --write-pbf seatac.osm.pbf
+    /// ```
+    const SEATAC_OSM_PBF: &[u8] = include_bytes!("../seatac.osm.pbf");
 
     #[tokio::test]
     async fn test_parse_osm_pbf() {
-        let mut cursor = Cursor::new(HONOLULU_OSM_PBF);
+        let mut cursor = Cursor::new(SEATAC_OSM_PBF);
         let stream = parse_osm_pbf(&mut cursor);
         let blocks = stream.try_collect::<Vec<_>>().await.unwrap();
 
@@ -391,19 +422,20 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        let blocks_from_locations = parse_osm_pbf_from_locations(&mut cursor, stream::iter(locations))
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
+        let blocks_from_locations =
+            parse_osm_pbf_from_locations(&mut cursor, stream::iter(locations))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
 
-        assert_eq!(blocks.len(), 101);
-        assert_eq!(blocks_from_locations.len(), 101);
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks_from_locations.len(), 3);
         assert_eq!(blocks, blocks_from_locations);
     }
 
     #[tokio::test]
     async fn test_parse_write_parse_pbf() {
-        let mut cursor = Cursor::new(HONOLULU_OSM_PBF);
+        let mut cursor = Cursor::new(SEATAC_OSM_PBF);
         let stream = parse_osm_pbf(&mut cursor);
         let blocks = stream.try_collect::<Vec<_>>().await.unwrap();
 
@@ -422,9 +454,6 @@ mod tests {
                 .unwrap();
 
             let inner = temp.into_inner();
-
-            // Blob header length is the same
-            assert_eq!(HONOLULU_OSM_PBF[..4], inner[..4]);
 
             let mut reparse_cursor = Cursor::new(inner);
             let reparse_stream = parse_osm_pbf(&mut reparse_cursor);

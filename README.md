@@ -11,10 +11,10 @@ Name|Default Feature|Decode (read)|Encode (write)
 Zlib|✅|✅|✅
 Zstd|❌|✅|✅
 Lzma|❌|✅|✅
-Bzip2|❌|✅|❌
+Bzip2|❌|❌|❌
 Lz4|❌|❌|❌
 
-Bzip2 is deprecated so you cannot encode with that format.
+Bzip2 has been deprecated for years so it is not supported,
 Lz4 support is [not available yet](https://github.com/Nemo157/async-compression/issues/12).
 
 There isn't any fine-grained control over encoding but feel free to file an issue if you are interested.

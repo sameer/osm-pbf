@@ -1,4 +1,4 @@
 /target
 /Cargo.lock
-*.osm.pbf
+*.osm
 .vscode

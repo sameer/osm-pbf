@@ -1,6 +1,6 @@
 [package]
 name = "osm-pbf"
-version = "0.1.0"
+version = "0.2.0"
 authors = [ "Sameer Puri <cargo@purisa.me>" ]
 edition = "2021"
 description = "Parse and write the OSM PBF Format"
@@ -16,18 +16,17 @@ default = ["zlib"]
 zlib = ["async-compression/zlib"]
 zstd = ["async-compression/zstd"]
 lzma = ["async-compression/lzma"]
-bzip2 = ["async-compression/bzip2"]
 
 [dependencies]
 async-compression = { version = "0.3", features = ["tokio"] }
 async-stream = "0.3"
 futures = "0.3"
-protobuf = "3.2"
+quick-protobuf = "0.8"
 thiserror = "1"
 tokio = { version = "1", features = ["io-util"] }
 
 [build-dependencies]
-protobuf-codegen = "3.2"
+pb-rs = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
