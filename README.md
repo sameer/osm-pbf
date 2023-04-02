@@ -1,23 +1,20 @@
 # osm-pbf
 
-Parse and write the [PBF format](https://wiki.openstreetmap.org/wiki/PBF_Format) for [Open Street Map](https://www.openstreetmap.org/#map=13/47.4475/-122.3084) (OSM).
+Read and write the [PBF format](https://wiki.openstreetmap.org/wiki/PBF_Format) for [Open Street Map](https://www.openstreetmap.org/#map=13/47.4475/-122.3084) (OSM).
 
-## Compression
+## Functionality
 
-There is a feature for each supported compression algorithm:
+### Reading
 
-Name|Default Feature|Decode (read)|Encode (write)
----|---|---|---
-Zlib|✅|✅|✅
-Zstd|❌|✅|✅
-Lzma|❌|✅|✅
-Bzip2|❌|❌|❌
-Lz4|❌|❌|❌
+There are two steps to reading the PBF format: parsing and decoding.
+Parsing builds [fileblocks](https://wiki.openstreetmap.org/wiki/PBF_Format#Encoding_OSM_entities_into_fileblocks) out of the raw data.
+Decoding converts fileblocks into the OSM [elements](https://wiki.openstreetmap.org/wiki/Elements) that they contain.
 
-Bzip2 has been deprecated for years so it is not supported,
-Lz4 support is [not available yet](https://github.com/Nemo157/async-compression/issues/12).
+### Writing
 
-There isn't any fine-grained control over encoding but feel free to file an issue if you are interested.
+Similarly, there are two steps to writing the PBF format: encoding and serialization.
+Encoding converts OSM elements into fileblocks. This crate does not support encoding yet.
+Serialization takes the fileblocks and  them into the PBF format.
 
 ## Execution
 
@@ -39,3 +36,20 @@ Write parallelization example:
 1. Split your blocks into chunks of size N. Note: each chunk must contain a Header block followed by any number of Primitive blocks.
 1. Call `write_osm_pbf` for each chunk independently (i.e. [buffer_unordered](https://docs.rs/futures/latest/futures/stream/trait.StreamExt.html#method.buffer_unordered)) with an in-memory vector as the writer.
 1. As each call completes, write them to their final destination (i.e. a file).
+
+## Compression
+
+There is a feature for each supported compression algorithm:
+
+Name|Default Feature|Supported
+---|---|---
+Zlib|✅|✅
+Zstd|❌|✅
+Lzma|❌|✅
+Lz4|❌|❌
+Bzip2|❌|❌
+
+Lz4 support is [not available yet](https://github.com/Nemo157/async-compression/issues/12).
+Bzip2 has been deprecated for years so it is not supported,
+
+There isn't any fine-grained control over encoding but feel free to file an issue if you are interested.

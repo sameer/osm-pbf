@@ -1,9 +1,9 @@
 [package]
 name = "osm-pbf"
-version = "0.2.0"
+version = "0.3.0"
 authors = [ "Sameer Puri <cargo@purisa.me>" ]
 edition = "2021"
-description = "Parse and write the OSM PBF Format"
+description = "Read and write the OSM PBF Format"
 homepage = "https://github.com/sameer/osm-pbf"
 repository = "https://github.com/sameer/osm-pbf"
 license = "MIT OR Apache-2.0"
@@ -20,8 +20,13 @@ lzma = ["async-compression/lzma"]
 [dependencies]
 async-compression = { version = "0.3", features = ["tokio"] }
 async-stream = "0.3"
+chrono = "0.4"
 futures = "0.3"
+itertools = "0.10"
+num-traits = "0.2"
+osm-types = "0.1.1"
 quick-protobuf = "0.8"
+rust_decimal = "1.29"
 thiserror = "1"
 tokio = { version = "1", features = ["io-util"] }
 
