@@ -14,7 +14,7 @@ Decoding converts fileblocks into the OSM [elements](https://wiki.openstreetmap.
 
 Similarly, there are two steps to writing the PBF format: encoding and serialization.
 Encoding converts OSM elements into fileblocks. This crate does not support encoding yet.
-Serialization takes the fileblocks and  them into the PBF format.
+Serialization flattens fileblocks into raw data.
 
 ## Execution
 
