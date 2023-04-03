@@ -1,14 +1,11 @@
 use std::{collections::HashMap, string::FromUtf8Error};
 
-use crate::{
-    protos::osmformat::{
-        mod_Relation::MemberType as MemberTypePbf, Info as InfoPbf, PrimitiveBlock, StringTable,
-    },
-    FileBlock,
+use crate::protos::osmformat::{
+    mod_Relation::MemberType as MemberTypePbf, Info as InfoPbf, PrimitiveBlock, StringTable,
 };
 use async_stream::try_stream;
 use chrono::NaiveDateTime;
-use futures::{Stream, StreamExt, TryStream};
+use futures::Stream;
 use itertools::multizip;
 use num_traits::CheckedAdd;
 use rust_decimal::{prelude::FromPrimitive, Decimal};
@@ -29,12 +26,11 @@ pub enum DecodeError {
     Position(#[from] rust_decimal::Error),
 }
 
-/// Decode a PBF [FileBlock] stream into an [Element] stream
+/// Decode a [PrimitiveBlock] into an [Element] stream
 ///
 /// There is no dependency on order, so this can be called in parallel.
 /// Technically, the file format is `(<HeaderBlock> (<PrimitiveBlock>)+)*`, but
-/// [FileBlock::Header] and [FileBlock::Other] are ignored since we are only
-/// interested in elements.
+/// [FileBlock::Header] and [FileBlock::Other] don't contain any elements.
 ///
 ///
 /// A number of hydration steps are performed:
@@ -45,145 +41,183 @@ pub enum DecodeError {
 /// * Delta-encoded values => actual values
 ///
 /// <https://wiki.openstreetmap.org/wiki/PBF_Format#Encoding_OSM_entities_into_fileblocks>
-pub fn decode_elements(
-    mut block_stream: impl Stream<Item = FileBlock> + Unpin,
-) -> impl TryStream<Ok = Element, Error = DecodeError> + Unpin {
-    Box::pin(try_stream! {
-        while let Some(block) = block_stream.next().await {
-            match block {
-                FileBlock::Primitive(PrimitiveBlock {
-                    stringtable: StringTable { s: raw_string_table, },
-                    primitivegroup,
-                    granularity,
-                    lat_offset,
-                    lon_offset,
-                    date_granularity,
-                }) => {
-                    let mut string_table = Vec::with_capacity(raw_string_table.len());
-                    for raw_string in raw_string_table {
-                        string_table.push(String::from_utf8(raw_string)?);
+pub fn decode_elements<'a>(
+    PrimitiveBlock {
+        stringtable: StringTable {
+            s: raw_string_table,
+        },
+        primitivegroup,
+        granularity,
+        lat_offset,
+        lon_offset,
+        date_granularity,
+    }: PrimitiveBlock,
+) -> impl Stream<Item = Result<Element, DecodeError>> + Send + 'a {
+    try_stream! {
+        let mut string_table = Vec::with_capacity(raw_string_table.len());
+        for raw_string in raw_string_table {
+            string_table.push(String::from_utf8(raw_string)?);
+        }
+
+        let mut granularity = Decimal::from_i32(granularity).unwrap();
+        granularity.set_scale(SCALE)?;
+        let mut lat_offset = Decimal::from_i64(lat_offset).unwrap();
+        lat_offset.set_scale(SCALE)?;
+        let mut lon_offset = Decimal::from_i64(lon_offset).unwrap();
+        lon_offset.set_scale(SCALE)?;
+
+        for group in primitivegroup {
+            for node in group.nodes {
+                yield Element::Node(Node {
+                    id: Id(node.id),
+                    attributes: kv_to_attributes(&node.keys, &node.vals, &string_table),
+                    info: node
+                        .info
+                        .as_ref()
+                        .map(|info| info_from_pbf(info, date_granularity, &string_table)),
+                    lat: packed_to_degrees(node.lat, &granularity, &lat_offset)?,
+                    lon: packed_to_degrees(node.lon, &granularity, &lon_offset)?,
+                });
+            }
+            if let Some(dense) = group.dense {
+                let (mut dense_node_it, mut dense_attrs_it) = {
+                    let id_it = Delta::from(dense.id.iter().copied());
+                    let lat_it = Delta::from(dense.lat.iter().copied());
+                    let lon_it = Delta::from(dense.lon.iter().copied());
+                    let dense_attrs =
+                        dense_kv_to_attributes(&dense.keys_vals, dense.id.len(), &string_table);
+                    #[cfg(debug)]
+                    {
+                        assert_eq!(dense.id.len(), dense.lat.len());
+                        assert_eq!(dense.lat.len(), dense.lon.len());
+                        if !dense_attrs.is_empty() {
+                            assert_eq!(dense.lon.len(), dense_attrs.len());
+                        }
                     }
+                    (multizip((id_it, lat_it, lon_it)), dense_attrs.into_iter())
+                };
 
-                    for group in primitivegroup {
-                        for node in group.nodes {
-                            yield Element::Node(Node {
-                                id: Id(node.id),
-                                attributes: kv_to_attributes(&node.keys, &node.vals, &string_table),
-                                info: node.info.as_ref().map(|info| info_from_pbf(info, date_granularity, &string_table)),
-                                lat: packed_to_degrees(node.lat, granularity, lat_offset)?,
-                                lon: packed_to_degrees(node.lon, granularity, lon_offset)?,
-                            });
+                let mut dense_info_it = if let Some(dense_info) = dense.denseinfo.as_ref() {
+                    let version_it = dense_info.version.iter().copied();
+                    let timestamp_it = Delta::from(dense_info.timestamp.iter().copied());
+                    let changeset_it = Delta::from(dense_info.changeset.iter().copied());
+                    let uid_it = Delta::from(dense_info.uid.iter().copied());
+                    let user_sid_it = Delta::from(dense_info.user_sid.iter().copied());
+                    let visible_it = dense_info.visible.iter().copied();
+                    #[cfg(debug)]
+                    {
+                        assert_eq!(dense_info.version.len(), dense_info.timestamp.len());
+                        assert_eq!(dense_info.timestamp.len(), dense_info.changeset.len());
+                        assert_eq!(dense_info.changeset.len(), dense_info.uid.len());
+                        assert_eq!(dense_info.uid.len(), dense_info.user_sid.len());
+                        if !dense_info.visible.is_empty() {
+                            assert_eq!(dense_info.user_sid.len(), dense_info.visible.len());
                         }
-                        if let Some(dense) = group.dense {
-                            let (mut dense_node_it, mut dense_attrs_it) = {
-                                let id_it = Delta::from(dense.id.iter().copied());
-                                let lat_it = Delta::from(dense.lat.iter().copied());
-                                let lon_it = Delta::from(dense.lon.iter().copied());
-                                let dense_attrs = dense_kv_to_attributes(&dense.keys_vals, dense.id.len(), &string_table);
-                                #[cfg(debug)]
-                                {
-                                    assert_eq!(dense.id.len(), dense.lat.len());
-                                    assert_eq!(dense.lat.len(), dense.lon.len());
-                                    if !dense_attrs.is_empty() {
-                                        assert_eq!(dense.lon.len(), dense_attrs.len());
-                                    }
-                                }
-                                (multizip((id_it, lat_it, lon_it)), dense_attrs.into_iter())
-                            };
+                    }
+                    Some((
+                        multizip((version_it, timestamp_it, changeset_it, uid_it, user_sid_it)),
+                        visible_it,
+                    ))
+                } else {
+                    None
+                };
 
-                            let mut dense_info_it = if let Some(dense_info) = dense.denseinfo.as_ref() {
-                                let version_it = dense_info.version.iter().copied();
-                                let timestamp_it = Delta::from(dense_info.timestamp.iter().copied());
-                                let changeset_it = Delta::from(dense_info.changeset.iter().copied());
-                                let uid_it = Delta::from(dense_info.uid.iter().copied());
-                                let user_sid_it = Delta::from(dense_info.user_sid.iter().copied());
-                                let visible_it = dense_info.visible.iter().copied();
-                                #[cfg(debug)]
-                                {
-                                    assert_eq!(dense_info.version.len(), dense_info.timestamp.len());
-                                    assert_eq!(dense_info.timestamp.len(), dense_info.changeset.len());
-                                    assert_eq!(dense_info.changeset.len(), dense_info.uid.len());
-                                    assert_eq!(dense_info.uid.len(), dense_info.user_sid.len());
-                                    if !dense_info.visible.is_empty() {
-                                        assert_eq!(dense_info.user_sid.len(), dense_info.visible.len());
-                                    }
-                                }
-                                Some((multizip((version_it, timestamp_it, changeset_it, uid_it, user_sid_it)), visible_it))
-                            } else { None };
-
-                            while let (Some((id, lat, lon)), attributes) = (dense_node_it.next(), dense_attrs_it.next()) {
-                                yield Element::Node(Node {
-                                    id: Id(id?),
-                                    attributes: attributes.unwrap_or_default(),
-                                    info: if let Some(((version, timestamp, changeset, uid, user_sid), visible)) = dense_info_it.as_mut().and_then(|(it, visible_it)| it.next().zip(Some(visible_it.next()))) {
-                                        Some(info_from_pbf(&InfoPbf {
-                                            version,
-                                            timestamp: Some(timestamp?),
-                                            changeset: Some(changeset?),
-                                            uid: Some(uid?),
-                                            // OSM authors indicated that this is incorrectly specified in the proto file
-                                            // so it is ok to convert like this.
-                                            user_sid: Some(user_sid? as u32),
-                                            visible,
-                                        }, date_granularity, &string_table))
-                                    } else { None },
-                                    lat: packed_to_degrees(lat?, granularity, lat_offset)?,
-                                    lon: packed_to_degrees(lon?, granularity, lon_offset)?,
-                                });
-                            }
-                        }
-                        for way in group.ways {
-                            #[cfg(debug)]
-                            {
-                                assert_eq!(way.lat.len(), way.lon.len());
-                                if !lat.is_empty() {
-                                    assert_eq!(way.refs.len(), way.lat.len());
-                                }
-                            }
-                            yield Element::Way(Way {
-                                id: Id(way.id),
-                                attributes: kv_to_attributes(&way.keys, &way.vals, &string_table),
-                                info: way.info.as_ref().map(|info| info_from_pbf(info, date_granularity, &string_table)),
-                                refs: {
-                                    let mut refs = Vec::with_capacity(way.refs.len());
-                                    let delta = Delta::from(way.refs.into_iter());
-                                    for r in delta {
-                                        refs.push(Id(r?));
-                                    }
-
-                                    refs
+                while let (Some((id, lat, lon)), attributes) =
+                    (dense_node_it.next(), dense_attrs_it.next())
+                {
+                    yield Element::Node(Node {
+                        id: Id(id?),
+                        attributes: attributes.unwrap_or_default(),
+                        info: if let Some((
+                            (version, timestamp, changeset, uid, user_sid),
+                            visible,
+                        )) = dense_info_it
+                            .as_mut()
+                            .and_then(|(it, visible_it)| it.next().zip(Some(visible_it.next())))
+                        {
+                            Some(info_from_pbf(
+                                &InfoPbf {
+                                    version,
+                                    timestamp: Some(timestamp?),
+                                    changeset: Some(changeset?),
+                                    uid: Some(uid?),
+                                    // OSM authors indicated that this is incorrectly specified in the proto file
+                                    // so it is ok to convert like this.
+                                    user_sid: Some(user_sid? as u32),
+                                    visible,
                                 },
-                            })
-                        }
-                        for relation in group.relations {
-                            #[cfg(debug)]
-                            {
-                                assert_eq!(relation.roles_sid.len(), relation.memids.len());
-                                assert_eq!(relation.memids.len(), relation.types.len());
-                            }
-                            let member_it = multizip((relation.roles_sid.iter().copied(), relation.memids.iter().copied(), relation.types.iter().copied()));
-                            let mut members = Vec::with_capacity(relation.roles_sid.len());
-                            for (role_sid, member_id, ty) in member_it {
-                                members.push(Member {
-                                    id: Id(member_id),
-                                    ty: ty.into(),
-                                    role: string_table.get(role_sid as usize).filter(|s| !s.is_empty()).cloned(),
-                                });
-                            }
-
-                            yield Element::Relation(Relation {
-                                id: Id(relation.id),
-                                attributes: kv_to_attributes(&relation.keys, &relation.vals, &string_table),
-                                info: relation.info.as_ref().map(|info| info_from_pbf(info, date_granularity, &string_table)),
-                                members,
-                            })
-                        }
+                                date_granularity,
+                                &string_table,
+                            ))
+                        } else {
+                            None
+                        },
+                        lat: packed_to_degrees(lat?, &granularity, &lat_offset)?,
+                        lon: packed_to_degrees(lon?, &granularity, &lon_offset)?,
+                    });
+                }
+            }
+            for way in group.ways {
+                #[cfg(debug)]
+                {
+                    assert_eq!(way.lat.len(), way.lon.len());
+                    if !lat.is_empty() {
+                        assert_eq!(way.refs.len(), way.lat.len());
                     }
-                },
-                FileBlock::Header(_) | FileBlock::Other { .. } => {},
+                }
+                yield Element::Way(Way {
+                    id: Id(way.id),
+                    attributes: kv_to_attributes(&way.keys, &way.vals, &string_table),
+                    info: way
+                        .info
+                        .as_ref()
+                        .map(|info| info_from_pbf(info, date_granularity, &string_table)),
+                    refs: {
+                        let mut refs = Vec::with_capacity(way.refs.len());
+                        let delta = Delta::from(way.refs.into_iter());
+                        for r in delta {
+                            refs.push(Id(r?));
+                        }
+
+                        refs
+                    },
+                })
+            }
+            for relation in group.relations {
+                #[cfg(debug)]
+                {
+                    assert_eq!(relation.roles_sid.len(), relation.memids.len());
+                    assert_eq!(relation.memids.len(), relation.types.len());
+                }
+                let member_it = multizip((
+                    relation.roles_sid.iter().copied(),
+                    relation.memids.iter().copied(),
+                    relation.types.iter().copied(),
+                ));
+                let mut members = Vec::with_capacity(relation.roles_sid.len());
+                for (role_sid, member_id, ty) in member_it {
+                    members.push(Member {
+                        id: Id(member_id),
+                        ty: ty.into(),
+                        role: string_table
+                            .get(role_sid as usize)
+                            .filter(|s| !s.is_empty())
+                            .cloned(),
+                    });
+                }
+
+                yield Element::Relation(Relation {
+                    id: Id(relation.id),
+                    attributes: kv_to_attributes(&relation.keys, &relation.vals, &string_table),
+                    info: relation
+                        .info
+                        .as_ref()
+                        .map(|info| info_from_pbf(info, date_granularity, &string_table)),
+                    members,
+                })
             }
         }
-    })
+    }
 }
 
 /// Converts key & value index arrays into an attribute map
@@ -307,23 +341,22 @@ where
     }
 }
 
+/// Latitude/longitude packed storage scale
+const SCALE: u32 = 9;
+
 /// Calculates the latitude/longitude degrees from the packed PBF format
 ///
 /// <https://wiki.openstreetmap.org/wiki/PBF_Format#Definition_of_OSMData_fileblock>
-fn packed_to_degrees(value: i64, granularity: i32, offset: i64) -> Result<Decimal, DecodeError> {
-    const SCALE: u32 = 9;
-
-    // SAFETY: these conversions cannot fail
+#[inline]
+fn packed_to_degrees(
+    value: i64,
+    granularity: &Decimal,
+    offset: &Decimal,
+) -> Result<Decimal, DecodeError> {
     let mut value = Decimal::from_i64(value).unwrap();
     value.set_scale(SCALE)?;
 
-    let mut granularity = Decimal::from_i32(granularity).unwrap();
-    granularity.set_scale(SCALE)?;
-
-    let mut offset = Decimal::from_i64(offset).unwrap();
-    offset.set_scale(SCALE)?;
-
-    Ok(offset + (granularity + value))
+    Ok((granularity * value) + offset)
 }
 
 impl From<MemberTypePbf> for MemberType {

@@ -43,13 +43,14 @@ pub enum FileBlock {
 
 #[cfg(test)]
 mod tests {
-    use futures::{stream, StreamExt, TryStreamExt};
+    use futures::{stream, TryStreamExt};
     use std::io::{Cursor, SeekFrom};
     use tokio::io::AsyncSeekExt;
 
     use crate::{
         decode::decode_elements, parse::get_osm_pbf_locations, parse::parse_osm_pbf,
         parse::parse_osm_pbf_from_locations, serialize::serialize_osm_pbf, serialize::Encoder,
+        FileBlock,
     };
 
     /// <https://www.openstreetmap.org/api/0.6/map?bbox=-122.3199%2C47.4303%2C-122.2964%2C47.4647>
@@ -73,7 +74,7 @@ mod tests {
             .await
             .unwrap();
         let blocks_from_locations =
-            parse_osm_pbf_from_locations(&mut cursor, stream::iter(locations))
+            parse_osm_pbf_from_locations(&mut cursor, futures::stream::iter(locations))
                 .try_collect::<Vec<_>>()
                 .await
                 .unwrap();
@@ -117,7 +118,16 @@ mod tests {
     async fn test_decode_elements() {
         let stream = parse_osm_pbf(Box::new(Cursor::new(SEATAC_OSM_PBF)));
 
-        let element_count = decode_elements(stream.into_stream().map(|b| b.unwrap()))
+        let element_count = stream
+            .try_filter_map(|block| async {
+                match block {
+                    FileBlock::Primitive(p) => Ok(Some(p)),
+                    _ => Ok(None),
+                }
+            })
+            .err_into::<anyhow::Error>()
+            .map_ok(|p| decode_elements(p).err_into::<anyhow::Error>())
+            .try_flatten()
             .try_fold(0, |acc, _| async move { Ok(acc + 1) })
             .await
             .unwrap();

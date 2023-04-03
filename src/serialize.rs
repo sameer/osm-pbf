@@ -38,10 +38,10 @@ pub enum SerializeError {
 }
 
 /// Applies the requested compression scheme, if any
-fn encode<R: AsyncBufRead + Unpin + 'static>(
+fn encode<R: AsyncBufRead + Unpin + Send + 'static>(
     reader: R,
     encoder: Option<Encoder>,
-) -> Pin<Box<dyn AsyncRead>> {
+) -> Pin<Box<dyn AsyncRead + Send>> {
     if let Some(encoder) = encoder {
         match encoder {
             #[cfg(feature = "zlib")]
@@ -57,8 +57,8 @@ fn encode<R: AsyncBufRead + Unpin + 'static>(
 }
 
 /// Serialize a stream of [FileBlock]s in the PBF format
-pub async fn serialize_osm_pbf<W: AsyncWrite + Unpin>(
-    mut blocks: impl Stream<Item = FileBlock> + Unpin,
+pub async fn serialize_osm_pbf<W: AsyncWrite + Unpin + Send>(
+    mut blocks: impl Stream<Item = FileBlock> + Unpin + Send,
     mut out: W,
     encoder: Option<Encoder>,
 ) -> Result<(), SerializeError> {
