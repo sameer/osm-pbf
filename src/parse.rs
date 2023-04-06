@@ -9,7 +9,7 @@ use crate::{
 };
 use async_compression::tokio::bufread::*;
 use async_stream::try_stream;
-use futures::{pin_mut, Stream, StreamExt, TryStreamExt};
+use futures::{pin_mut, Stream, StreamExt,  TryStreamExt};
 use quick_protobuf::{BytesReader, MessageRead};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
@@ -94,8 +94,6 @@ async fn read_blob_header_len<R: AsyncRead + Unpin + Send>(
 }
 
 /// Creates a stream for the decoded data from this block
-///
-/// [quick_protobuf::reader::deserialize_from_slice] but doesn't read length
 fn decode_blob(blob: Blob) -> Result<Pin<Box<dyn AsyncRead + Send>>, ParseError> {
     Ok(match blob.data {
         Data::raw(raw) => Box::pin(Cursor::new(raw)),
@@ -226,6 +224,7 @@ pub fn parse_osm_pbf_from_locations<'a, R: AsyncRead + AsyncSeek + Unpin + Send 
     }
 }
 
+/// [quick_protobuf::reader::deserialize_from_slice] but doesn't read length
 fn deserialize_from_slice<'a, M: MessageRead<'a>>(
     bytes: &'a [u8],
 ) -> Result<M, quick_protobuf::Error> {
