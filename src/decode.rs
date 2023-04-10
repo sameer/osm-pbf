@@ -1,14 +1,16 @@
-use std::{collections::HashMap, string::FromUtf8Error};
+use std::string::FromUtf8Error;
 
 use crate::protos::osmformat::{
     mod_Relation::MemberType as MemberTypePbf, Info as InfoPbf, PrimitiveBlock, StringTable,
 };
 use async_stream::try_stream;
 use chrono::NaiveDateTime;
+use fnv::FnvHashMap as HashMap;
 use futures::Stream;
-use itertools::multizip;
+use itertools::izip;
+use kstring::KString;
 use num_traits::CheckedAdd;
-use rust_decimal::{prelude::FromPrimitive, Decimal};
+use rust_decimal::Decimal;
 use thiserror::Error;
 
 use osm_types::{Element, Id, Info, Member, MemberType, Node, Relation, Way};
@@ -56,54 +58,54 @@ pub fn decode_elements<'a>(
     try_stream! {
         let mut string_table = Vec::with_capacity(raw_string_table.len());
         for raw_string in raw_string_table {
-            string_table.push(String::from_utf8(raw_string)?);
+            string_table.push(KString::from(String::from_utf8(raw_string)?));
         }
 
-        let mut granularity = Decimal::from_i32(granularity).unwrap();
-        granularity.set_scale(SCALE)?;
-        let mut lat_offset = Decimal::from_i64(lat_offset).unwrap();
-        lat_offset.set_scale(SCALE)?;
-        let mut lon_offset = Decimal::from_i64(lon_offset).unwrap();
-        lon_offset.set_scale(SCALE)?;
+        let date_granularity = i64::from(date_granularity);
 
         for group in primitivegroup {
             for node in group.nodes {
                 yield Element::Node(Node {
                     id: Id(node.id),
-                    attributes: kv_to_attributes(&node.keys, &node.vals, &string_table),
+                    attributes: kv_to_attributes(node.keys, node.vals, &string_table),
                     info: node
                         .info
-                        .as_ref()
                         .map(|info| info_from_pbf(info, date_granularity, &string_table)),
-                    lat: packed_to_degrees(node.lat, &granularity, &lat_offset)?,
-                    lon: packed_to_degrees(node.lon, &granularity, &lon_offset)?,
+                    lat: packed_to_degrees(node.lat, granularity, lat_offset)?,
+                    lon: packed_to_degrees(node.lon, granularity, lon_offset)?,
                 });
             }
             if let Some(dense) = group.dense {
                 let (mut dense_node_it, mut dense_attrs_it) = {
-                    let id_it = Delta::from(dense.id.iter().copied());
-                    let lat_it = Delta::from(dense.lat.iter().copied());
-                    let lon_it = Delta::from(dense.lon.iter().copied());
+                    let dense_attrs_size_hint = dense.id.len();
+
+                    let id_it = Delta::from(dense.id.into_iter());
+                    let lat_it = Delta::from(dense.lat.into_iter());
+                    let lon_it = Delta::from(dense.lon.into_iter());
+
                     let dense_attrs =
-                        dense_kv_to_attributes(&dense.keys_vals, dense.id.len(), &string_table);
+                        dense_kv_to_attributes(dense.keys_vals, &string_table, dense_attrs_size_hint);
                     #[cfg(debug)]
                     {
                         assert_eq!(dense.id.len(), dense.lat.len());
                         assert_eq!(dense.lat.len(), dense.lon.len());
-                        if !dense_attrs.is_empty() {
-                            assert_eq!(dense.lon.len(), dense_attrs.len());
+                        if !dense.keys_vals.is_empty() {
+                            assert_eq!(
+                                dense.lon.len(),
+                                dense.keys_vals.iter().filter(|k_or_v| *k_or_v == 0).count()
+                            );
                         }
                     }
-                    (multizip((id_it, lat_it, lon_it)), dense_attrs.into_iter())
+                    (izip!(id_it, lat_it, lon_it), dense_attrs)
                 };
 
-                let mut dense_info_it = if let Some(dense_info) = dense.denseinfo.as_ref() {
-                    let version_it = dense_info.version.iter().copied();
-                    let timestamp_it = Delta::from(dense_info.timestamp.iter().copied());
-                    let changeset_it = Delta::from(dense_info.changeset.iter().copied());
-                    let uid_it = Delta::from(dense_info.uid.iter().copied());
-                    let user_sid_it = Delta::from(dense_info.user_sid.iter().copied());
-                    let visible_it = dense_info.visible.iter().copied();
+                let mut dense_info_it = if let Some(dense_info) = dense.denseinfo {
+                    let version_it = dense_info.version.into_iter();
+                    let timestamp_it = Delta::from(dense_info.timestamp.into_iter());
+                    let changeset_it = Delta::from(dense_info.changeset.into_iter());
+                    let uid_it = Delta::from(dense_info.uid.into_iter());
+                    let user_sid_it = Delta::from(dense_info.user_sid.into_iter());
+                    let visible_it = dense_info.visible.into_iter();
                     #[cfg(debug)]
                     {
                         assert_eq!(dense_info.version.len(), dense_info.timestamp.len());
@@ -115,7 +117,7 @@ pub fn decode_elements<'a>(
                         }
                     }
                     Some((
-                        multizip((version_it, timestamp_it, changeset_it, uid_it, user_sid_it)),
+                        izip!(version_it, timestamp_it, changeset_it, uid_it, user_sid_it),
                         visible_it,
                     ))
                 } else {
@@ -136,7 +138,7 @@ pub fn decode_elements<'a>(
                             .and_then(|(it, visible_it)| it.next().zip(Some(visible_it.next())))
                         {
                             Some(info_from_pbf(
-                                &InfoPbf {
+                                InfoPbf {
                                     version,
                                     timestamp: Some(timestamp?),
                                     changeset: Some(changeset?),
@@ -152,8 +154,8 @@ pub fn decode_elements<'a>(
                         } else {
                             None
                         },
-                        lat: packed_to_degrees(lat?, &granularity, &lat_offset)?,
-                        lon: packed_to_degrees(lon?, &granularity, &lon_offset)?,
+                        lat: packed_to_degrees(lat?, granularity, lat_offset)?,
+                        lon: packed_to_degrees(lon?, granularity, lon_offset)?,
                     });
                 }
             }
@@ -167,10 +169,9 @@ pub fn decode_elements<'a>(
                 }
                 yield Element::Way(Way {
                     id: Id(way.id),
-                    attributes: kv_to_attributes(&way.keys, &way.vals, &string_table),
+                    attributes: kv_to_attributes(way.keys, way.vals, &string_table),
                     info: way
                         .info
-                        .as_ref()
                         .map(|info| info_from_pbf(info, date_granularity, &string_table)),
                     refs: {
                         let mut refs = Vec::with_capacity(way.refs.len());
@@ -189,29 +190,25 @@ pub fn decode_elements<'a>(
                     assert_eq!(relation.roles_sid.len(), relation.memids.len());
                     assert_eq!(relation.memids.len(), relation.types.len());
                 }
-                let member_it = multizip((
-                    relation.roles_sid.iter().copied(),
-                    relation.memids.iter().copied(),
-                    relation.types.iter().copied(),
-                ));
-                let mut members = Vec::with_capacity(relation.roles_sid.len());
-                for (role_sid, member_id, ty) in member_it {
-                    members.push(Member {
-                        id: Id(member_id),
-                        ty: ty.into(),
-                        role: string_table
-                            .get(role_sid as usize)
-                            .filter(|s| !s.is_empty())
-                            .cloned(),
-                    });
-                }
+
+                let members = izip!(
+                    relation.roles_sid.into_iter(),
+                    relation.memids.into_iter(),
+                    relation.types.into_iter(),
+                ).map(|(role_sid, member_id, ty)| Member {
+                    id: Id(member_id),
+                    ty: ty.into(),
+                    role: string_table
+                        .get(role_sid as usize)
+                        .filter(|s| !s.is_empty())
+                        .cloned(),
+                }).collect();
 
                 yield Element::Relation(Relation {
                     id: Id(relation.id),
-                    attributes: kv_to_attributes(&relation.keys, &relation.vals, &string_table),
+                    attributes: kv_to_attributes(relation.keys, relation.vals, &string_table),
                     info: relation
                         .info
-                        .as_ref()
                         .map(|info| info_from_pbf(info, date_granularity, &string_table)),
                     members,
                 })
@@ -221,23 +218,22 @@ pub fn decode_elements<'a>(
 }
 
 /// Converts key & value index arrays into an attribute map
+#[inline]
 fn kv_to_attributes(
-    keys: &[u32],
-    vals: &[u32],
-    string_table: &[String],
-) -> HashMap<String, String> {
+    keys: Vec<u32>,
+    vals: Vec<u32>,
+    string_table: &[KString],
+) -> HashMap<KString, KString> {
     #[cfg(debug)]
     assert_eq!(keys.len(), vals.len());
 
-    keys.iter()
-        .copied()
-        .zip(vals.iter().copied())
+    keys.into_iter()
+        .zip(vals.into_iter())
         .filter_map(|(k, v)| {
             string_table
                 .get(k as usize)
-                .zip(string_table.get(v as usize))
-                .filter(|(k, _v)| !k.is_empty())
-                .map(|(k, v)| (k.clone(), v.clone()))
+                .cloned()
+                .zip(string_table.get(v as usize).cloned())
         })
         .collect()
 }
@@ -248,45 +244,77 @@ fn kv_to_attributes(
 /// for _multiple_ nodes are packed into a single array and end-delimited by a `0`.
 ///
 /// <https://wiki.openstreetmap.org/wiki/PBF_Format#Nodes>
+#[inline]
 fn dense_kv_to_attributes(
-    keys_vals: &[i32],
+    keys_vals: Vec<i32>,
+    string_table: &'_ [KString],
     size_hint: usize,
-    string_table: &[String],
-) -> Vec<HashMap<String, String>> {
-    // Nothing to unpack
-    if keys_vals.is_empty() {
-        return vec![];
+) -> impl Iterator<Item = HashMap<KString, KString>> + '_ {
+    struct DenseKVIterator<'a, KI> {
+        keys_vals: KI,
+        string_table: &'a [KString],
+        size_hint: usize,
+        key: Option<usize>,
+        current: HashMap<KString, KString>,
     }
 
-    let mut acc: Vec<HashMap<_, _>> = Vec::with_capacity(size_hint);
+    impl<'a, KI> Iterator for DenseKVIterator<'a, KI>
+    where
+        KI: Iterator<Item = i32>,
+    {
+        type Item = HashMap<KString, KString>;
 
-    let mut current = HashMap::new();
-    let mut key = None;
-    for &k_or_v in keys_vals {
-        if k_or_v == 0 {
-            acc.push(current);
-            current = HashMap::new();
-        } else if let Some(key) = key.take() {
-            current.insert(
-                key,
-                string_table
-                    .get(k_or_v as usize)
-                    .cloned()
-                    .unwrap_or_default(),
-            );
-        } else {
-            key = Some(
-                string_table
-                    .get(k_or_v as usize)
-                    .cloned()
-                    .unwrap_or_default(),
-            );
+        #[inline]
+        fn next(&mut self) -> Option<Self::Item> {
+            for k_or_v in self.keys_vals.by_ref() {
+                let k_or_v = k_or_v as usize;
+                if k_or_v == 0 {
+                    #[cfg(debug)]
+                    assert_eq!(self.key, None);
+                    let mut ret = HashMap::default();
+                    std::mem::swap(&mut self.current, &mut ret);
+                    return Some(ret);
+                } else if let Some(key) = self.key.take() {
+                    if let Some((key, value)) = self
+                        .string_table
+                        .get(key)
+                        .cloned()
+                        .zip(self.string_table.get(k_or_v).cloned())
+                    {
+                        self.current.insert(key, value);
+                    }
+                } else {
+                    self.key = Some(k_or_v);
+                }
+            }
+
+            #[cfg(debug)]
+            {
+                assert_eq!(self.key, None);
+                assert!(self.current.is_empty());
+            }
+            None
+        }
+
+        #[inline]
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            (self.size_hint, Some(self.size_hint))
         }
     }
-    #[cfg(debug)]
-    assert_eq!(key, None);
 
-    acc
+    DenseKVIterator {
+        size_hint: {
+            if keys_vals.is_empty() {
+                0
+            } else {
+                size_hint
+            }
+        },
+        keys_vals: keys_vals.into_iter(),
+        string_table,
+        key: None,
+        current: HashMap::default(),
+    }
 }
 
 /// Converts an iterator into a cumulative sum iterator with checks for overflow
@@ -319,6 +347,7 @@ where
 {
     type Item = Result<T, DecodeError>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         match self.iterator.next() {
             Some(x) => {
@@ -339,6 +368,11 @@ where
             None => None,
         }
     }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iterator.size_hint()
+    }
 }
 
 /// Latitude/longitude packed storage scale
@@ -350,16 +384,23 @@ const SCALE: u32 = 9;
 #[inline]
 fn packed_to_degrees(
     value: i64,
-    granularity: &Decimal,
-    offset: &Decimal,
-) -> Result<Decimal, DecodeError> {
-    let mut value = Decimal::from_i64(value).unwrap();
-    value.set_scale(SCALE)?;
+    granularity: i32,
+    offset: i64,
+) -> Result<Decimal, rust_decimal::Error> {
+    let value: i128 = value.into();
+    let granularity: i128 = granularity.into();
+    let offset: i128 = offset.into();
 
-    Ok((granularity * value) + offset)
+    let scale_free = value
+        .checked_mul(granularity)
+        .and_then(|product| product.checked_add(offset))
+        .ok_or(rust_decimal::Error::ExceedsMaximumPossibleValue)?;
+
+    Decimal::try_from_i128_with_scale(scale_free, SCALE)
 }
 
 impl From<MemberTypePbf> for MemberType {
+    #[inline]
     fn from(value: MemberTypePbf) -> Self {
         match value {
             MemberTypePbf::NODE => Self::Node,
@@ -370,12 +411,13 @@ impl From<MemberTypePbf> for MemberType {
 }
 
 /// Decodes the timestamp and user_sid fields to create the non-pbf representation
-fn info_from_pbf(info: &InfoPbf, date_granularity: i32, string_table: &[String]) -> Info {
+#[inline]
+fn info_from_pbf(info: InfoPbf, date_granularity: i64, string_table: &[KString]) -> Info {
     Info {
         version: info.version,
         timestamp: info
             .timestamp
-            .map(|ts| ts * i64::from(date_granularity))
+            .map(|ts| ts * date_granularity)
             .and_then(NaiveDateTime::from_timestamp_millis),
         changeset: info.changeset,
         uid: info.uid,

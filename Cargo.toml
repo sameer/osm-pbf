@@ -1,6 +1,6 @@
 [package]
 name = "osm-pbf"
-version = "0.3.1"
+version = "0.3.2"
 authors = [ "Sameer Puri <cargo@purisa.me>" ]
 edition = "2021"
 description = "Read and write the OSM PBF Format"
@@ -21,10 +21,12 @@ lzma = ["async-compression/lzma"]
 async-compression = { version = "0.3", features = ["tokio"] }
 async-stream = "0.3"
 chrono = "0.4"
+fnv = "1"
 futures = "0.3"
 itertools = "0.10"
+kstring = "2"
 num-traits = "0.2"
-osm-types = "0.1.1"
+osm-types = "0.1.2"
 quick-protobuf = "0.8"
 rust_decimal = "1.29"
 thiserror = "1"

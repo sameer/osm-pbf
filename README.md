@@ -26,16 +26,15 @@ The code is serial in nature but it's possible to parallelize encoding/decoding 
 
 Read parallelization example:
 
-1. Call `get_osm_pbf_locations` to get a stream of fileblock locations.
-1. Chunk the fileblocks into relevant groups. Namely: header followed by any number of primitive fileblocks.
-1. Call `parse_osm_pbf_from_locations` for each chunk independently (i.e. [buffer_unordered](https://docs.rs/futures/latest/futures/stream/trait.StreamExt.html#method.buffer_unordered)).
-1. Process blocks as desired.
+1. Call `get_osm_pbf_locations` to get a stream of fileblock locations
+1. Call `parse_osm_pbf_at_location` for each location independently
+1. Process blocks as desired
 
 Write parallelization example:
 
-1. Split your blocks into chunks of size N. Note: each chunk must contain a Header block followed by any number of Primitive blocks.
-1. Call `write_osm_pbf` for each chunk independently (i.e. [buffer_unordered](https://docs.rs/futures/latest/futures/stream/trait.StreamExt.html#method.buffer_unordered)) with an in-memory vector as the writer.
-1. As each call completes, write them to their final destination (i.e. a file).
+1. Split your blocks into chunks
+1. Call `write_osm_pbf` for each chunk independently with an in-memory vector as the writer
+1. As each call completes, write them to their final destination (i.e. a file)
 
 ## Compression
 
@@ -50,6 +49,6 @@ Lz4|❌|❌
 Bzip2|❌|❌
 
 Lz4 support is [not available yet](https://github.com/Nemo157/async-compression/issues/12).
-Bzip2 has been deprecated for years so it is not supported,
+Bzip2 has been deprecated for years so it is not supported.
 
 There isn't any fine-grained control over encoding but feel free to file an issue if you are interested.

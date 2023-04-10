@@ -44,12 +44,11 @@ pub enum FileBlock {
 #[cfg(test)]
 mod tests {
     use futures::{stream, TryStreamExt};
-    use std::io::{Cursor, SeekFrom};
-    use tokio::io::AsyncSeekExt;
+    use std::io::Cursor;
 
     use crate::{
         decode::decode_elements, parse::get_osm_pbf_locations, parse::parse_osm_pbf,
-        parse::parse_osm_pbf_from_locations, serialize::serialize_osm_pbf, serialize::Encoder,
+        parse::parse_osm_pbf_at_location, serialize::serialize_osm_pbf, serialize::Encoder,
         FileBlock,
     };
 
@@ -63,21 +62,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_osm_pbf() {
-        let mut cursor = Cursor::new(SEATAC_OSM_PBF);
-        let stream = parse_osm_pbf(&mut cursor);
+        let stream = parse_osm_pbf(Cursor::new(SEATAC_OSM_PBF));
         let blocks = stream.try_collect::<Vec<_>>().await.unwrap();
 
         // Go back to the beginning so we can parse again
-        cursor.seek(SeekFrom::Start(0)).await.unwrap();
-        let locations = get_osm_pbf_locations(&mut cursor)
+        let blocks_from_locations = get_osm_pbf_locations(Cursor::new(SEATAC_OSM_PBF))
+            .and_then(|location| parse_osm_pbf_at_location(Cursor::new(SEATAC_OSM_PBF), location))
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        let blocks_from_locations =
-            parse_osm_pbf_from_locations(&mut cursor, futures::stream::iter(locations))
-                .try_collect::<Vec<_>>()
-                .await
-                .unwrap();
 
         assert_eq!(blocks.len(), 3);
         assert_eq!(blocks_from_locations.len(), 3);
@@ -86,8 +79,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_serialize_parse_pbf() {
-        let mut cursor = Cursor::new(SEATAC_OSM_PBF);
-        let stream = parse_osm_pbf(&mut cursor);
+        let stream = parse_osm_pbf(Cursor::new(SEATAC_OSM_PBF));
         let blocks = stream.try_collect::<Vec<_>>().await.unwrap();
 
         for encoder in [

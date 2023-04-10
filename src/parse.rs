@@ -9,7 +9,7 @@ use crate::{
 };
 use async_compression::tokio::bufread::*;
 use async_stream::try_stream;
-use futures::{pin_mut, Stream, StreamExt,  TryStreamExt};
+use futures::{pin_mut, Stream, TryStreamExt};
 use quick_protobuf::{BytesReader, MessageRead};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
@@ -109,6 +109,8 @@ fn decode_blob(blob: Blob) -> Result<Pin<Box<dyn AsyncRead + Send>>, ParseError>
                 Data::raw(_) | Data::None => unreachable!(),
                 Data::zlib_data(_) => "zlib",
                 Data::lzma_data(_) => "lzma",
+                #[allow(deprecated)]
+                Data::OBSOLETE_bzip2_data(_) => "bzip2",
                 Data::lz4_data(_) => "lz4",
                 Data::zstd_data(_) => "zstd",
             }))
@@ -185,43 +187,36 @@ pub fn get_osm_pbf_locations<'a, R: AsyncRead + AsyncSeek + Unpin + Send + 'a>(
     }
 }
 
-/// Parse the PBF format into a stream of [FileBlock]s
+/// Parse the PBF format at a given [FileBlockLocation] to get a [FileBlock]
 ///
 /// Use this in combination with [get_osm_pbf_locations] for reading in parallel.
-pub fn parse_osm_pbf_from_locations<'a, R: AsyncRead + AsyncSeek + Unpin + Send + 'a>(
+pub async fn parse_osm_pbf_at_location<'a, R: AsyncRead + AsyncSeek + Unpin + Send + 'a>(
     mut pbf_reader: R,
-    mut locations: impl Stream<Item = FileBlockLocation> + Unpin + Send + 'a,
-) -> impl Stream<Item = Result<FileBlock, ParseError>> + Send + 'a {
-    try_stream! {
-        while let Some(location) = locations.next().await {
-            pbf_reader.seek(location.seek).await?;
+    location: FileBlockLocation,
+) -> Result<FileBlock, ParseError> {
+    pbf_reader.seek(location.seek).await?;
 
-            let mut buf = vec![0; location.len];
-            pbf_reader.read_exact(buf.as_mut()).await?;
-            let blob_body: Blob = deserialize_from_slice(buf.as_slice())?;
+    let mut buf = vec![0; location.len];
+    pbf_reader.read_exact(buf.as_mut()).await?;
+    let blob_body: Blob = deserialize_from_slice(buf.as_slice())?;
 
-            let blob_body_len = blob_body.raw_size.unwrap_or_default() as usize;
-            if location.len > BLOB_MAX_LEN {
-                Err(ParseError::BlobExceedsMaxLength(blob_body_len))?;
-            }
-
-            let mut buf = Vec::with_capacity(blob_body_len);
-            let mut blob_stream = decode_blob(blob_body)?;
-            blob_stream.read_to_end(&mut buf).await?;
-
-            match location.r#type.as_str() {
-                "OSMHeader" => {
-                    yield FileBlock::Header(deserialize_from_slice(buf.as_slice())?);
-                },
-                "OSMData" => {
-                    yield FileBlock::Primitive(deserialize_from_slice(buf.as_slice())?);
-                }
-                _ => {
-                    yield FileBlock::Other { r#type: location.r#type, bytes: buf, }
-                }
-            }
-        }
+    let blob_body_len = blob_body.raw_size.unwrap_or_default() as usize;
+    if location.len > BLOB_MAX_LEN {
+        Err(ParseError::BlobExceedsMaxLength(blob_body_len))?;
     }
+
+    let mut buf = Vec::with_capacity(blob_body_len);
+    let mut blob_stream = decode_blob(blob_body)?;
+    blob_stream.read_to_end(&mut buf).await?;
+
+    Ok(match location.r#type.as_str() {
+        "OSMHeader" => FileBlock::Header(deserialize_from_slice(buf.as_slice())?),
+        "OSMData" => FileBlock::Primitive(deserialize_from_slice(buf.as_slice())?),
+        _ => FileBlock::Other {
+            r#type: location.r#type,
+            bytes: buf,
+        },
+    })
 }
 
 /// [quick_protobuf::reader::deserialize_from_slice] but doesn't read length

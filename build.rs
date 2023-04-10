@@ -27,6 +27,7 @@ fn main() -> std::io::Result<()> {
             .unwrap()
             .single_module(true)
             .dont_use_cow(true)
+            .add_deprecated_fields(true)
             .build(),
     )
     .unwrap();
