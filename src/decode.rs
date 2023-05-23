@@ -1,12 +1,10 @@
-use std::string::FromUtf8Error;
+use std::{iter::Zip, rc::Rc, string::FromUtf8Error, vec::IntoIter};
 
 use crate::protos::osmformat::{
-    mod_Relation::MemberType as MemberTypePbf, Info as InfoPbf, PrimitiveBlock, StringTable,
+    self, mod_Relation::MemberType as MemberTypePbf, Info as InfoPbf, PrimitiveBlock, StringTable,
 };
-use async_stream::try_stream;
 use chrono::NaiveDateTime;
 use fnv::FnvHashMap as HashMap;
-use futures::Stream;
 use itertools::izip;
 use kstring::KString;
 use num_traits::CheckedAdd;
@@ -24,6 +22,8 @@ pub enum DecodeError {
     UnknownRelationMemberType(i32),
     #[error("Addition overflow while decoding delta-encoded values")]
     DeltaOverflow,
+    #[error("Multiplication overflow while decoding timestamps")]
+    TimestampOverflow,
     #[error("Failed to calculate node position: {0}")]
     Position(#[from] rust_decimal::Error),
 }
@@ -54,37 +54,42 @@ pub fn decode_elements<'a>(
         lon_offset,
         date_granularity,
     }: PrimitiveBlock,
-) -> impl Stream<Item = Result<Element, DecodeError>> + Send + 'a {
-    try_stream! {
-        let mut string_table = Vec::with_capacity(raw_string_table.len());
-        for raw_string in raw_string_table {
-            string_table.push(KString::from(String::from_utf8(raw_string)?));
-        }
+) -> impl Iterator<Item = Result<Element, DecodeError>> + 'a {
+    let (string_table, string_table_decode_err) = match raw_string_table
+        .into_iter()
+        .map(|raw_string| Ok(KString::from(String::from_utf8(raw_string)?)))
+        .collect::<Result<Vec<_>, DecodeError>>()
+    {
+        Ok(string_table) => (string_table, None),
+        Err(err) => (vec![], Some(err)),
+    };
 
-        let date_granularity = i64::from(date_granularity);
+    let string_table: Rc<[KString]> = Rc::from(string_table);
+    let date_granularity = i64::from(date_granularity);
 
-        for group in primitivegroup {
-            for node in group.nodes {
-                yield Element::Node(Node {
-                    id: Id(node.id),
-                    attributes: kv_to_attributes(node.keys, node.vals, &string_table),
-                    info: node
-                        .info
-                        .map(|info| info_from_pbf(info, date_granularity, &string_table)),
-                    lat: packed_to_degrees(node.lat, granularity, lat_offset)?,
-                    lon: packed_to_degrees(node.lon, granularity, lon_offset)?,
-                });
-            }
-            if let Some(dense) = group.dense {
-                let (mut dense_node_it, mut dense_attrs_it) = {
+    string_table_decode_err
+        .into_iter()
+        .map(Err)
+        .chain(primitivegroup.into_iter().flat_map(move |group| {
+            // A PrimitiveGroup cannot contain different types of objects
+            let (size_hint, group_its) = if !group.nodes.is_empty() {
+                (
+                    group.nodes.len(),
+                    GroupIterators::Nodes(group.nodes.into_iter()),
+                )
+            } else if let Some(dense) = group.dense {
+                let (dense_nodes_it, dense_attrs_it) = {
                     let dense_attrs_size_hint = dense.id.len();
 
                     let id_it = Delta::from(dense.id.into_iter());
                     let lat_it = Delta::from(dense.lat.into_iter());
                     let lon_it = Delta::from(dense.lon.into_iter());
 
-                    let dense_attrs =
-                        dense_kv_to_attributes(dense.keys_vals, &string_table, dense_attrs_size_hint);
+                    let dense_attrs = dense_kv_to_attributes(
+                        dense.keys_vals,
+                        string_table.clone(),
+                        dense_attrs_size_hint,
+                    );
                     #[cfg(debug)]
                     {
                         assert_eq!(dense.id.len(), dense.lat.len());
@@ -96,10 +101,10 @@ pub fn decode_elements<'a>(
                             );
                         }
                     }
-                    (izip!(id_it, lat_it, lon_it), dense_attrs)
+                    (id_it.zip(lat_it).zip(lon_it), dense_attrs)
                 };
 
-                let mut dense_info_it = if let Some(dense_info) = dense.denseinfo {
+                let dense_info_it = if let Some(dense_info) = dense.denseinfo {
                     let version_it = dense_info.version.into_iter();
                     let timestamp_it = Delta::from(dense_info.timestamp.into_iter());
                     let changeset_it = Delta::from(dense_info.changeset.into_iter());
@@ -117,25 +122,128 @@ pub fn decode_elements<'a>(
                         }
                     }
                     Some((
-                        izip!(version_it, timestamp_it, changeset_it, uid_it, user_sid_it),
+                        version_it
+                            .zip(timestamp_it)
+                            .zip(changeset_it)
+                            .zip(uid_it)
+                            .zip(user_sid_it),
                         visible_it,
                     ))
                 } else {
                     None
                 };
 
-                while let (Some((id, lat, lon)), attributes) =
-                    (dense_node_it.next(), dense_attrs_it.next())
-                {
-                    yield Element::Node(Node {
+                (
+                    dense_attrs_it.size_hint,
+                    GroupIterators::Dense {
+                        dense_nodes_it: Box::new(dense_nodes_it),
+                        dense_attrs_it,
+                        dense_info_it: dense_info_it.map(Box::new),
+                    },
+                )
+            } else if !group.ways.is_empty() {
+                (
+                    group.ways.len(),
+                    GroupIterators::Ways(group.ways.into_iter()),
+                )
+            } else if !group.relations.is_empty() {
+                (
+                    group.relations.len(),
+                    GroupIterators::Relations(group.relations.into_iter()),
+                )
+            } else {
+                (0, GroupIterators::Empty)
+            };
+
+            Decoder {
+                group_its,
+                size_hint,
+                string_table: string_table.clone(),
+                granularity,
+                lat_offset,
+                lon_offset,
+                date_granularity,
+            }
+        }))
+}
+
+enum GroupIterators {
+    Nodes(IntoIter<osmformat::Node>),
+    Dense {
+        dense_nodes_it: Box<
+            Zip<
+                Zip<Delta<i64, IntoIter<i64>>, Delta<i64, IntoIter<i64>>>,
+                Delta<i64, IntoIter<i64>>,
+            >,
+        >,
+        dense_attrs_it: DenseKVIterator<IntoIter<i32>>,
+        dense_info_it: Option<
+            Box<(
+                Zip<
+                    Zip<
+                        Zip<
+                            Zip<IntoIter<i32>, Delta<i64, IntoIter<i64>>>,
+                            Delta<i64, IntoIter<i64>>,
+                        >,
+                        Delta<i32, IntoIter<i32>>,
+                    >,
+                    Delta<i32, IntoIter<i32>>,
+                >,
+                IntoIter<bool>,
+            )>,
+        >,
+    },
+    Ways(IntoIter<osmformat::Way>),
+    Relations(IntoIter<osmformat::Relation>),
+    Empty,
+}
+
+struct Decoder {
+    group_its: GroupIterators,
+    size_hint: usize,
+    string_table: Rc<[KString]>,
+    granularity: i32,
+    lat_offset: i64,
+    lon_offset: i64,
+    date_granularity: i64,
+}
+
+impl Iterator for Decoder {
+    type Item = Result<Element, DecodeError>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.group_its {
+            GroupIterators::Nodes(nodes) => nodes.next().map(|node| {
+                Ok(Element::Node(Node {
+                    id: Id(node.id),
+                    tags: kv_to_attributes(node.keys, node.vals, &self.string_table),
+                    info: node
+                        .info
+                        .map(|info| info_from_pbf(info, self.date_granularity, &self.string_table))
+                        .transpose()?,
+                    lat: packed_to_degrees(node.lat, self.granularity, self.lat_offset)?,
+                    lon: packed_to_degrees(node.lon, self.granularity, self.lon_offset)?,
+                }))
+            }),
+            GroupIterators::Dense {
+                dense_nodes_it,
+                dense_attrs_it,
+                dense_info_it,
+            } => dense_nodes_it.next().map(
+                |((id, lat), lon): (
+                    (Result<i64, DecodeError>, Result<i64, DecodeError>),
+                    Result<i64, DecodeError>,
+                )| {
+                    Ok(Element::Node(Node {
                         id: Id(id?),
-                        attributes: attributes.unwrap_or_default(),
+                        tags: dense_attrs_it.next().unwrap_or_default(),
                         info: if let Some((
-                            (version, timestamp, changeset, uid, user_sid),
+                            ((((version, timestamp), changeset), uid), user_sid),
                             visible,
                         )) = dense_info_it
                             .as_mut()
-                            .and_then(|(it, visible_it)| it.next().zip(Some(visible_it.next())))
+                            .and_then(|its| its.0.next().zip(Some(its.1.next())))
                         {
                             Some(info_from_pbf(
                                 InfoPbf {
@@ -148,18 +256,18 @@ pub fn decode_elements<'a>(
                                     user_sid: Some(user_sid? as u32),
                                     visible,
                                 },
-                                date_granularity,
-                                &string_table,
-                            ))
+                                self.date_granularity,
+                                &self.string_table,
+                            )?)
                         } else {
                             None
                         },
-                        lat: packed_to_degrees(lat?, granularity, lat_offset)?,
-                        lon: packed_to_degrees(lon?, granularity, lon_offset)?,
-                    });
-                }
-            }
-            for way in group.ways {
+                        lat: packed_to_degrees(lat?, self.granularity, self.lat_offset)?,
+                        lon: packed_to_degrees(lon?, self.granularity, self.lon_offset)?,
+                    }))
+                },
+            ),
+            GroupIterators::Ways(ways) => ways.next().map(|way| {
                 #[cfg(debug)]
                 {
                     assert_eq!(way.lat.len(), way.lon.len());
@@ -167,12 +275,13 @@ pub fn decode_elements<'a>(
                         assert_eq!(way.refs.len(), way.lat.len());
                     }
                 }
-                yield Element::Way(Way {
+                Ok(Element::Way(Way {
                     id: Id(way.id),
-                    attributes: kv_to_attributes(way.keys, way.vals, &string_table),
+                    tags: kv_to_attributes(way.keys, way.vals, &self.string_table),
                     info: way
                         .info
-                        .map(|info| info_from_pbf(info, date_granularity, &string_table)),
+                        .map(|info| info_from_pbf(info, self.date_granularity, &self.string_table))
+                        .transpose()?,
                     refs: {
                         let mut refs = Vec::with_capacity(way.refs.len());
                         let delta = Delta::from(way.refs.into_iter());
@@ -182,9 +291,9 @@ pub fn decode_elements<'a>(
 
                         refs
                     },
-                })
-            }
-            for relation in group.relations {
+                }))
+            }),
+            GroupIterators::Relations(relations) => relations.next().map(|relation| {
                 #[cfg(debug)]
                 {
                     assert_eq!(relation.roles_sid.len(), relation.memids.len());
@@ -195,25 +304,35 @@ pub fn decode_elements<'a>(
                     relation.roles_sid.into_iter(),
                     relation.memids.into_iter(),
                     relation.types.into_iter(),
-                ).map(|(role_sid, member_id, ty)| Member {
+                )
+                .map(|(role_sid, member_id, ty)| Member {
                     id: Id(member_id),
                     ty: ty.into(),
-                    role: string_table
+                    role: self
+                        .string_table
                         .get(role_sid as usize)
                         .filter(|s| !s.is_empty())
                         .cloned(),
-                }).collect();
+                })
+                .collect();
 
-                yield Element::Relation(Relation {
+                Ok(Element::Relation(Relation {
                     id: Id(relation.id),
-                    attributes: kv_to_attributes(relation.keys, relation.vals, &string_table),
+                    tags: kv_to_attributes(relation.keys, relation.vals, &self.string_table),
                     info: relation
                         .info
-                        .map(|info| info_from_pbf(info, date_granularity, &string_table)),
+                        .map(|info| info_from_pbf(info, self.date_granularity, &self.string_table))
+                        .transpose()?,
                     members,
-                })
-            }
+                }))
+            }),
+            GroupIterators::Empty => None,
         }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.size_hint, Some(self.size_hint))
     }
 }
 
@@ -247,61 +366,9 @@ fn kv_to_attributes(
 #[inline]
 fn dense_kv_to_attributes(
     keys_vals: Vec<i32>,
-    string_table: &'_ [KString],
+    string_table: Rc<[KString]>,
     size_hint: usize,
-) -> impl Iterator<Item = HashMap<KString, KString>> + '_ {
-    struct DenseKVIterator<'a, KI> {
-        keys_vals: KI,
-        string_table: &'a [KString],
-        size_hint: usize,
-        key: Option<usize>,
-        current: HashMap<KString, KString>,
-    }
-
-    impl<'a, KI> Iterator for DenseKVIterator<'a, KI>
-    where
-        KI: Iterator<Item = i32>,
-    {
-        type Item = HashMap<KString, KString>;
-
-        #[inline]
-        fn next(&mut self) -> Option<Self::Item> {
-            for k_or_v in self.keys_vals.by_ref() {
-                let k_or_v = k_or_v as usize;
-                if k_or_v == 0 {
-                    #[cfg(debug)]
-                    assert_eq!(self.key, None);
-                    let mut ret = HashMap::default();
-                    std::mem::swap(&mut self.current, &mut ret);
-                    return Some(ret);
-                } else if let Some(key) = self.key.take() {
-                    if let Some((key, value)) = self
-                        .string_table
-                        .get(key)
-                        .cloned()
-                        .zip(self.string_table.get(k_or_v).cloned())
-                    {
-                        self.current.insert(key, value);
-                    }
-                } else {
-                    self.key = Some(k_or_v);
-                }
-            }
-
-            #[cfg(debug)]
-            {
-                assert_eq!(self.key, None);
-                assert!(self.current.is_empty());
-            }
-            None
-        }
-
-        #[inline]
-        fn size_hint(&self) -> (usize, Option<usize>) {
-            (self.size_hint, Some(self.size_hint))
-        }
-    }
-
+) -> DenseKVIterator<IntoIter<i32>> {
     DenseKVIterator {
         size_hint: {
             if keys_vals.is_empty() {
@@ -314,6 +381,58 @@ fn dense_kv_to_attributes(
         string_table,
         key: None,
         current: HashMap::default(),
+    }
+}
+
+struct DenseKVIterator<KI> {
+    keys_vals: KI,
+    string_table: Rc<[KString]>,
+    size_hint: usize,
+    key: Option<usize>,
+    current: HashMap<KString, KString>,
+}
+
+impl<KI> Iterator for DenseKVIterator<KI>
+where
+    KI: Iterator<Item = i32>,
+{
+    type Item = HashMap<KString, KString>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        for k_or_v in self.keys_vals.by_ref() {
+            let k_or_v = k_or_v as usize;
+            if k_or_v == 0 {
+                #[cfg(debug)]
+                assert_eq!(self.key, None);
+                let mut ret = HashMap::default();
+                std::mem::swap(&mut self.current, &mut ret);
+                return Some(ret);
+            } else if let Some(key) = self.key.take() {
+                if let Some((key, value)) = self
+                    .string_table
+                    .get(key)
+                    .cloned()
+                    .zip(self.string_table.get(k_or_v).cloned())
+                {
+                    self.current.insert(key, value);
+                }
+            } else {
+                self.key = Some(k_or_v);
+            }
+        }
+
+        #[cfg(debug)]
+        {
+            assert_eq!(self.key, None);
+            assert!(self.current.is_empty());
+        }
+        None
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.size_hint, Some(self.size_hint))
     }
 }
 
@@ -400,7 +519,6 @@ fn packed_to_degrees(
 }
 
 impl From<MemberTypePbf> for MemberType {
-    #[inline]
     fn from(value: MemberTypePbf) -> Self {
         match value {
             MemberTypePbf::NODE => Self::Node,
@@ -412,12 +530,20 @@ impl From<MemberTypePbf> for MemberType {
 
 /// Decodes the timestamp and user_sid fields to create the non-pbf representation
 #[inline]
-fn info_from_pbf(info: InfoPbf, date_granularity: i64, string_table: &[KString]) -> Info {
-    Info {
+fn info_from_pbf(
+    info: InfoPbf,
+    date_granularity: i64,
+    string_table: &[KString],
+) -> Result<Info, DecodeError> {
+    Ok(Info {
         version: info.version,
         timestamp: info
             .timestamp
-            .map(|ts| ts * date_granularity)
+            .map(|ts| {
+                ts.checked_mul(date_granularity)
+                    .ok_or(DecodeError::TimestampOverflow)
+            })
+            .transpose()?
             .and_then(NaiveDateTime::from_timestamp_millis),
         changeset: info.changeset,
         uid: info.uid,
@@ -428,5 +554,5 @@ fn info_from_pbf(info: InfoPbf, date_granularity: i64, string_table: &[KString])
                 .cloned()
         }),
         visible: info.visible,
-    }
+    })
 }

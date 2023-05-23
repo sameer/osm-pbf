@@ -63,23 +63,24 @@ pub async fn serialize_osm_pbf<W: AsyncWrite + Unpin + Send>(
     encoder: Option<Encoder>,
 ) -> Result<(), SerializeError> {
     while let Some(block) = blocks.next().await {
-        let (raw_size, blob_bytes, type_pb) = match block {
-            FileBlock::Header(header) => (
-                header.get_size(),
-                serialize_into_vec(&header)?,
-                OSM_HEADER_TYPE.to_string(),
-            ),
-            FileBlock::Primitive(primitive) => (
-                primitive.get_size(),
-                serialize_into_vec(&primitive)?,
-                OSM_DATA_TYPE.to_string(),
-            ),
-            FileBlock::Other { r#type, bytes } => (bytes.len(), bytes, r#type),
+        let raw_size = match &block {
+            FileBlock::Header(header) => header.get_size(),
+            FileBlock::Primitive(primitive) => primitive.get_size(),
+            FileBlock::Other { bytes, .. } => bytes.len(),
         };
-
         if raw_size > BLOB_MAX_LEN {
-            Err(SerializeError::BlobExceedsMaxLength(raw_size))?;
+            return Err(SerializeError::BlobExceedsMaxLength(raw_size));
         }
+
+        let (blob_bytes, type_pb) = match block {
+            FileBlock::Header(header) => {
+                (serialize_into_vec(&header)?, OSM_HEADER_TYPE.to_string())
+            }
+            FileBlock::Primitive(primitive) => {
+                (serialize_into_vec(&primitive)?, OSM_DATA_TYPE.to_string())
+            }
+            FileBlock::Other { r#type, bytes } => (bytes, r#type),
+        };
 
         let blob_encoded = {
             let cursor = Cursor::new(blob_bytes);
@@ -90,6 +91,7 @@ pub async fn serialize_osm_pbf<W: AsyncWrite + Unpin + Send>(
         };
 
         let blob = Blob {
+            // Only set if this is compressed
             raw_size: if encoder.is_some() {
                 Some(raw_size as i32)
             } else {
@@ -114,7 +116,7 @@ pub async fn serialize_osm_pbf<W: AsyncWrite + Unpin + Send>(
 
         let blob_header_size = blob_header.get_size();
         if blob_header_size > BLOB_HEADER_MAX_LEN {
-            Err(SerializeError::BlobHeaderExceedsMaxLength(blob_header_size))?;
+            return Err(SerializeError::BlobHeaderExceedsMaxLength(blob_header_size));
         }
 
         out.write_i32(blob_header_size as i32).await?;
